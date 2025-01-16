@@ -194,7 +194,7 @@ pub fn main() !void {
     // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
     //                     ^^^ 8 bytes (u64)      N bytes  ^
     //                                                     |
-    //                                                      ____Offset 0 is here.
+    //                                                      ____ Offset 0 is here.
     // The idea:
     // 1. Get the header size.
     // 2. Read the header size, convert to UTF-8, parse JSON.
