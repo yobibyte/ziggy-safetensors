@@ -231,9 +231,7 @@ pub fn main() !void {
     // Let's get the 2D array printed to compare to what we see in Python (run test.py to compare).
     var arr_allocator = std.heap.page_allocator;
     var weights = try NDArray(f32).init(&arr_allocator, rows, cols);
-    // I am not sure how to write a deinit method properly.
-    // I will do it manually here. Help me, somebody!
-    defer arr_allocator.free(weights.data);
+    defer weights.deinit();
     weights.copy_from(&f32_values);
     weights.print();
 }
