@@ -190,10 +190,12 @@ pub fn batch_bf16bytes_to_fp32(bf16_buf: []u8, bf16_count: usize, fp32_buf: []f3
 }
 
 /// Get weights for a particular layer.
-pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, file: *std.fs.File, allocator: *std.mem.Allocator) !*NDArray(f32) {
+pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, safetensors_path: []const u8, allocator: *std.mem.Allocator) !*NDArray(f32) {
     // Let's now take one layer and print it out.
     // We will need to read bytes from the file using the offset info
     // in the LayerMetadata struct.
+    var file = try std.fs.openFileAbsolute(safetensors_path, .{});
+    defer file.close();
 
     const metadata_bytesize = HEADER_SIZE_BUFF_SIZE + header_size;
     const read_len = layer_metadata.offset_end - layer_metadata.offset_start;
@@ -226,7 +228,9 @@ pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, file: *std
     return weights;
 }
 
-pub fn main() !void {
+/// This function returns the weights values given the safetensors file path and a layer name.
+/// I need this dependency in my other code, this is to be used as external library.
+pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8) !*NDArray(f32) {
     // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
     // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
     //                     ^^^ 8 bytes (u64)      N bytes  ^
@@ -250,23 +254,24 @@ pub fn main() !void {
         layers_info.deinit();
     }
 
-    var file = try std.fs.openFileAbsolute(SAFETENSORS_FPATH, .{});
-    defer file.close();
-
     // At this point, we will know all the layers names, their types, shapes, and offsets.
-    const header_size = try get_safetensors_content(SAFETENSORS_FPATH, &allocator, &layers_info);
+    const header_size = try get_safetensors_content(safetensors_path, &allocator, &layers_info);
 
     var layer_metadata: LayerMetadata = undefined;
     for (layers_info.items) |layer_spec| {
         layer_spec.print();
-        if (std.mem.eql(u8, layer_spec.name, LAYER_TO_CONVERT)) {
+        if (std.mem.eql(u8, layer_spec.name, layer_name)) {
             layer_metadata = layer_spec;
         }
     }
     layer_metadata.print();
 
     // We can extract the weights now.
-    var weights = try load_weights(header_size, &layer_metadata, &file, &allocator);
+    return load_weights(header_size, &layer_metadata, safetensors_path, &allocator);
+}
+
+pub fn main() !void {
+    var weights = try extract_weights(SAFETENSORS_FPATH, LAYER_TO_CONVERT);
     weights.print();
-    defer weights.deinit();
+    weights.deinit();
 }
