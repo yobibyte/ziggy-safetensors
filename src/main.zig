@@ -58,7 +58,12 @@ pub fn NDArray(comptime T: type) type {
             self.rows = rows;
             self.cols = cols;
             self.data = try allocator.alloc(T, rows * cols);
+            self.allocator = allocator;
             return self;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.allocator.free(self.data);
         }
 
         pub fn at(self: *@This(), row: usize, col: usize) *T {
