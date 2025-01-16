@@ -48,7 +48,7 @@ const LayerMetadata = struct {
 /// We are living on the edge.
 pub fn NDArray(comptime T: type) type {
     return struct {
-        allocator: *std.mem.Allocator,
+        allocator: *const std.mem.Allocator,
         rows: usize,
         cols: usize,
         data: []T,
@@ -102,20 +102,11 @@ pub fn NDArray(comptime T: type) type {
     };
 }
 
-pub fn main() !void {
-    // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
-    // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
-    //                     ^^^ 8 bytes (u64)      N bytes  ^
-    //                                                     |
-    //                                                     _____Offset 0 is here.
-    // The idea:
-    // 1. Get the header size.
-    // 2. Read the header size, convert to UTF-8, parse JSON.
-    // 3. Header items have everything we need: model name, dtype, shapes, and offsets.
-    // Offset start tells us where to start reading in the file to get the numbers.
-    // dtype tells use how much bytes we need to read and what to cast the numbers to.
-
-    var file = try std.fs.openFileAbsolute("/home/yobibyte/Downloads/model.safetensors", .{});
+pub fn get_safetensors_content(fpath: []const u8, allocator: *std.mem.Allocator, layers_info: *std.ArrayList(LayerMetadata)) !u64 {
+    // The code below is extremely hacky and was only tested on a model I mentioned above.
+    // Ideally, we want a better JSON parser here, but it was not the goal.
+    // Feel free to send PRs!
+    var file = try std.fs.openFileAbsolute(fpath, .{});
     defer file.close();
 
     // Read 8 bytes first to get the header size.
@@ -125,26 +116,11 @@ pub fn main() !void {
 
     const header_size = std.mem.readInt(u64, &header_size_buf, std.builtin.Endian.little);
     std.debug.print("Header size: {d} bytes.\n", .{header_size});
-
-    // Read the header and parse the JSON.
-    const allocator = std.heap.page_allocator;
-
-    // The code below is extremely hacky and was only tested on a model I mentioned above.
-    // Ideally, we want a better JSON parser here, but it was not the goal.
-    // Feel free to send PRs!
-    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
-    defer {
-        for (layers_info.items) |*item| {
-            allocator.free(item.shape);
-        }
-        layers_info.deinit();
-    }
-
     // Read the header.
     const header_buf = try allocator.alloc(u8, header_size);
     defer allocator.free(header_buf);
     _ = try file.read(header_buf[0..]);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_buf, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator.*, header_buf, .{});
     defer parsed.deinit();
     var iter = parsed.value.object.iterator();
 
@@ -180,19 +156,75 @@ pub fn main() !void {
         const offset_start: u64 = @as(u64, @intCast(unk_offsets.items[0].integer));
         const offset_end: u64 = @as(u64, @intCast(unk_offsets.items[1].integer));
 
+        // Let's allocate memory for the struct fields so that
+        // we do not depend on the json object and can free it after we exit this function scope.
+        const name = try allocator.alloc(u8, key.*.len);
+        @memcpy(name, key.*[0..key.*.len]);
+        const dtype_cpy = try allocator.alloc(u8, dtype.len);
+        @memcpy(dtype_cpy, dtype);
+        const shape_cpy = try allocator.alloc(u64, shape.len);
+        @memcpy(shape_cpy, shape);
+
         const cur_layer = LayerMetadata{
-            .name = key.*,
-            .dtype = dtype,
+            .name = name,
+            .dtype = dtype_cpy,
             .offset_start = offset_start,
             .offset_end = offset_end,
-            .shape = shape,
+            .shape = shape_cpy,
         };
         try layers_info.append(cur_layer);
     }
+    return header_size;
+}
+
+/// Get a slice of bytes representing bf16 and convert them to a slice of fp32.
+/// bf16 and fp32 have the same sign+exponent -> we can just treat f32 as a bf16 padded with zeros from the right side.
+pub fn batch_bf16bytes_to_fp32(bf16_buf: []u8, bf16_count: usize, fp32_buf: []f32) void {
+    const bf16_ptr = @as([*]u16, @ptrCast(@alignCast(bf16_buf.ptr)));
+    const bf16_slice = bf16_ptr[0..bf16_count];
+    const shift_width: u32 = 16;
+    for (bf16_slice, 0..) |bf, i| {
+        const bits: u32 = @as(u32, bf) << shift_width;
+        fp32_buf[i] = @bitCast(bits);
+    }
+}
+
+pub fn main() !void {
+    // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
+    // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
+    //                     ^^^ 8 bytes (u64)      N bytes  ^
+    //                                                     |
+    //                                                     _____Offset 0 is here.
+    // The idea:
+    // 1. Get the header size.
+    // 2. Read the header size, convert to UTF-8, parse JSON.
+    // 3. Header items have everything we need: model name, dtype, shapes, and offsets.
+    // Offset start tells us where to start reading in the file to get the numbers.
+    // dtype tells use how much bytes we need to read and what to cast the numbers to.
+
+    // Read the header and parse the JSON.
+    var allocator = std.heap.page_allocator;
+
+    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
+    defer {
+        for (layers_info.items) |*item| {
+            allocator.free(item.shape);
+        }
+        layers_info.deinit();
+    }
+
+    var file = try std.fs.openFileAbsolute(SAFETENSORS_FPATH, .{});
+    defer file.close();
+
+    const header_size = try get_safetensors_content(SAFETENSORS_FPATH, &allocator, &layers_info);
+
     for (layers_info.items) |layer_spec| {
         layer_spec.print();
     }
 
+    // Let's now take one layer and print it out.
+    // We will need to read bytes from the file using the offset info
+    // in the LayerMetadata struct.
     var layer_metadata: LayerMetadata = undefined;
     for (layers_info.items) |layer_spec| {
         if (std.mem.eql(u8, layer_spec.name, LAYER_TO_CONVERT)) {
@@ -201,13 +233,11 @@ pub fn main() !void {
     }
     layer_metadata.print();
 
-    const start: usize = layer_metadata.offset_start;
-    const end: usize = layer_metadata.offset_end;
     const metadata_bytesize = HEADER_SIZE_BUFF_SIZE + header_size;
-    const read_len = end - start;
+    const read_len = layer_metadata.offset_end - layer_metadata.offset_start;
 
     // Weight offsets are starting with 0 meaning the first byte after the header.
-    try file.seekTo(start + metadata_bytesize);
+    try file.seekTo(layer_metadata.offset_start + metadata_bytesize);
     const wbuf = try allocator.alloc(u8, read_len);
     const bytes_read = try file.read(wbuf);
     if (bytes_read != read_len) {
@@ -216,22 +246,17 @@ pub fn main() !void {
     }
     defer allocator.free(wbuf);
 
-    // bf16 and fp32 have the same sign+exponent -> we can just treat f32 as a bf16 padded with zeros from the right side. for parsing purposes
     const bf16_count: usize = read_len / 2;
     const rows = layer_metadata.shape[0];
     const cols = layer_metadata.shape[1];
     // Again, here we assume that we have a two dimensional array.
     // Check that the shape corresponds to amount of bytes we read.
     std.debug.assert(rows * cols == bf16_count);
-    const bf16_ptr = @as([*]u16, @ptrCast(@alignCast(wbuf.ptr)));
-    const bf16_slice = bf16_ptr[0..bf16_count];
-    const shift_width: u32 = 16;
+
+    // Original weights are in bf16, let's get fp32 from those.
     var f32_values = try allocator.alloc(f32, bf16_count);
     defer allocator.free(f32_values);
-    for (bf16_slice, 0..) |bf, i| {
-        const bits: u32 = @as(u32, bf) << shift_width;
-        f32_values[i] = @bitCast(bits);
-    }
+    batch_bf16bytes_to_fp32(wbuf, bf16_count, f32_values);
 
     // Let's get the 2D array printed to compare to what we see in Python (run test.py to compare).
     var arr_allocator = std.heap.page_allocator;
