@@ -189,49 +189,11 @@ pub fn batch_bf16bytes_to_fp32(bf16_buf: []u8, bf16_count: usize, fp32_buf: []f3
     }
 }
 
-pub fn main() !void {
-    // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
-    // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
-    //                     ^^^ 8 bytes (u64)      N bytes  ^
-    //                                                     |
-    //                                                      ____ Offset 0 is here.
-    // The idea:
-    // 1. Get the header size.
-    // 2. Read the header size, convert to UTF-8, parse JSON.
-    // 3. Header items have everything we need: model name, dtype, shapes, and offsets.
-    // Offset start tells us where to start reading in the file to get the numbers.
-    // dtype tells use how much bytes we need to read and what to cast the numbers to.
-
-    // Read the header and parse the JSON.
-    var allocator = std.heap.page_allocator;
-
-    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
-    defer {
-        for (layers_info.items) |*item| {
-            allocator.free(item.shape);
-        }
-        layers_info.deinit();
-    }
-
-    var file = try std.fs.openFileAbsolute(SAFETENSORS_FPATH, .{});
-    defer file.close();
-
-    const header_size = try get_safetensors_content(SAFETENSORS_FPATH, &allocator, &layers_info);
-
-    for (layers_info.items) |layer_spec| {
-        layer_spec.print();
-    }
-
+/// Get weights for a particular layer.
+pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, file: *std.fs.File, allocator: *std.mem.Allocator) !*NDArray(f32) {
     // Let's now take one layer and print it out.
     // We will need to read bytes from the file using the offset info
     // in the LayerMetadata struct.
-    var layer_metadata: LayerMetadata = undefined;
-    for (layers_info.items) |layer_spec| {
-        if (std.mem.eql(u8, layer_spec.name, LAYER_TO_CONVERT)) {
-            layer_metadata = layer_spec;
-        }
-    }
-    layer_metadata.print();
 
     const metadata_bytesize = HEADER_SIZE_BUFF_SIZE + header_size;
     const read_len = layer_metadata.offset_end - layer_metadata.offset_start;
@@ -259,9 +221,52 @@ pub fn main() !void {
     batch_bf16bytes_to_fp32(wbuf, bf16_count, f32_values);
 
     // Let's get the 2D array printed to compare to what we see in Python (run test.py to compare).
-    var arr_allocator = std.heap.page_allocator;
-    var weights = try NDArray(f32).init(&arr_allocator, rows, cols);
-    defer weights.deinit();
+    var weights = try NDArray(f32).init(allocator, rows, cols);
     weights.copy_from(&f32_values);
+    return weights;
+}
+
+pub fn main() !void {
+    // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
+    // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
+    //                     ^^^ 8 bytes (u64)      N bytes  ^
+    //                                                     |
+    //                                                      ____ Offset 0 is here.
+    // The idea:
+    // 1. Get the header size.
+    // 2. Read the header size, convert to UTF-8, parse JSON.
+    // 3. Header items have everything we need: model name, dtype, shapes, and offsets.
+    // Offset start tells us where to start reading in the file to get the numbers.
+    // dtype tells use how much bytes we need to read and what to cast the numbers to.
+
+    // Read the header and parse the JSON.
+    var allocator = std.heap.page_allocator;
+
+    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
+    defer {
+        for (layers_info.items) |*item| {
+            allocator.free(item.shape);
+        }
+        layers_info.deinit();
+    }
+
+    var file = try std.fs.openFileAbsolute(SAFETENSORS_FPATH, .{});
+    defer file.close();
+
+    // At this point, we will know all the layers names, their types, shapes, and offsets.
+    const header_size = try get_safetensors_content(SAFETENSORS_FPATH, &allocator, &layers_info);
+
+    var layer_metadata: LayerMetadata = undefined;
+    for (layers_info.items) |layer_spec| {
+        layer_spec.print();
+        if (std.mem.eql(u8, layer_spec.name, LAYER_TO_CONVERT)) {
+            layer_metadata = layer_spec;
+        }
+    }
+    layer_metadata.print();
+
+    // We can extract the weights now.
+    var weights = try load_weights(header_size, &layer_metadata, &file, &allocator);
     weights.print();
+    defer weights.deinit();
 }
