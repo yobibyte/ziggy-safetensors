@@ -17,27 +17,56 @@ const LAYER_TO_CONVERT = "model.layers.9.self_attn.v_proj.weight";
 // Safetensors header has a JSON with metadata about our layers.
 // They all have a name, a shape, dtype, and offsets which tell us
 // how to find the bytes for those weights in the binary file.
-const LayerMetadata = struct {
-    name: []const u8,
-    shape: []u64,
-    dtype: []const u8,
-    offset_start: u64,
-    offset_end: u64,
+pub fn LayerMetadata() type {
+    return struct {
+        allocator: std.mem.Allocator,
+        name: []u8,
+        shape: []u64,
+        dtype: []u8,
+        offset_start: u64,
+        offset_end: u64,
 
-    pub fn print(self: *const LayerMetadata) void {
-        std.debug.print("{s}\n  dtype:{s}\n", .{ self.name, self.dtype });
+        const Self = @This();
 
-        std.debug.print("  shape: ", .{});
-        for (self.shape) |el| {
-            std.debug.print("{d} ", .{el});
+        pub fn init(allocator: std.mem.Allocator, name: []const u8, shape: []u64, dtype: []const u8, offset_start: u64, offset_end: u64) !*Self {
+            var self = try allocator.create(Self);
+            self.allocator = allocator;
+
+            // Let's allocate memory for the struct fields so that
+            // we do not depend on the json object and can free it after we exit this function scope.
+            self.name = try allocator.alloc(u8, name.len);
+            @memcpy(self.name, name);
+            self.shape = try allocator.alloc(u64, shape.len);
+            @memcpy(self.shape, shape);
+            self.dtype = try allocator.alloc(u8, dtype.len);
+            @memcpy(self.dtype, dtype);
+            self.offset_start = offset_start;
+            self.offset_end = offset_end;
+            return self;
         }
-        std.debug.print("\n", .{});
-        std.debug.print("  data_offsets: ", .{});
-        std.debug.print("{d} {d} ", .{ self.offset_start, self.offset_end });
 
-        std.debug.print("\n\n", .{});
-    }
-};
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.name);
+            self.allocator.free(self.shape);
+            self.allocator.free(self.dtype);
+            self.allocator.destroy(self);
+        }
+
+        pub fn print(self: *const LayerMetadata()) void {
+            std.debug.print("{s}\n  dtype:{s}\n", .{ self.name, self.dtype });
+
+            std.debug.print("  shape: ", .{});
+            for (self.shape) |el| {
+                std.debug.print("{d} ", .{el});
+            }
+            std.debug.print("\n", .{});
+            std.debug.print("  data_offsets: ", .{});
+            std.debug.print("{d} {d} ", .{ self.offset_start, self.offset_end });
+
+            std.debug.print("\n\n", .{});
+        }
+    };
+}
 
 /// A struct that makes you belive that it is a two dimensional array.
 /// In practice, it's a 1D array with methods to access it as 2D.
@@ -48,12 +77,12 @@ const LayerMetadata = struct {
 /// We are living on the edge.
 pub fn NDArray(comptime T: type) type {
     return struct {
-        allocator: *const std.mem.Allocator,
+        allocator: std.mem.Allocator,
         rows: usize,
         cols: usize,
         data: []T,
 
-        pub fn init(allocator: *std.mem.Allocator, rows: usize, cols: usize) !*@This() {
+        pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !*@This() {
             var self = try allocator.create(@This());
             self.rows = rows;
             self.cols = cols;
@@ -64,6 +93,7 @@ pub fn NDArray(comptime T: type) type {
 
         pub fn deinit(self: *@This()) void {
             self.allocator.free(self.data);
+            self.allocator.destroy(self);
         }
 
         pub fn at(self: *@This(), row: usize, col: usize) *T {
@@ -102,7 +132,7 @@ pub fn NDArray(comptime T: type) type {
     };
 }
 
-pub fn get_safetensors_content(fpath: []const u8, allocator: *std.mem.Allocator, layers_info: *std.ArrayList(LayerMetadata)) !u64 {
+pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, layers_info: *std.ArrayList(*LayerMetadata())) !u64 {
     // The code below is extremely hacky and was only tested on a model I mentioned above.
     // Ideally, we want a better JSON parser here, but it was not the goal.
     // Feel free to send PRs!
@@ -120,7 +150,7 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: *std.mem.Allocator,
     const header_buf = try allocator.alloc(u8, header_size);
     defer allocator.free(header_buf);
     _ = try file.read(header_buf[0..]);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator.*, header_buf, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_buf, .{});
     defer parsed.deinit();
     var iter = parsed.value.object.iterator();
 
@@ -155,23 +185,14 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: *std.mem.Allocator,
         const unk_offsets = val.object.get("data_offsets").?.array;
         const offset_start: u64 = @as(u64, @intCast(unk_offsets.items[0].integer));
         const offset_end: u64 = @as(u64, @intCast(unk_offsets.items[1].integer));
-
-        // Let's allocate memory for the struct fields so that
-        // we do not depend on the json object and can free it after we exit this function scope.
-        const name = try allocator.alloc(u8, key.*.len);
-        @memcpy(name, key.*[0..key.*.len]);
-        const dtype_cpy = try allocator.alloc(u8, dtype.len);
-        @memcpy(dtype_cpy, dtype);
-        const shape_cpy = try allocator.alloc(u64, shape.len);
-        @memcpy(shape_cpy, shape);
-
-        const cur_layer = LayerMetadata{
-            .name = name,
-            .dtype = dtype_cpy,
-            .offset_start = offset_start,
-            .offset_end = offset_end,
-            .shape = shape_cpy,
-        };
+        const cur_layer = try LayerMetadata().init(
+            allocator,
+            key.*[0..key.*.len],
+            shape,
+            dtype,
+            offset_start,
+            offset_end,
+        );
         try layers_info.append(cur_layer);
     }
     return header_size;
@@ -190,7 +211,7 @@ pub fn batch_bf16bytes_to_fp32(bf16_buf: []u8, bf16_count: usize, fp32_buf: []f3
 }
 
 /// Get weights for a particular layer.
-pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, safetensors_path: []const u8, allocator: *std.mem.Allocator) !*NDArray(f32) {
+pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata(), safetensors_path: []const u8, allocator: std.mem.Allocator) !*NDArray(f32) {
     // Let's now take one layer and print it out.
     // We will need to read bytes from the file using the offset info
     // in the LayerMetadata struct.
@@ -230,7 +251,7 @@ pub fn load_weights(header_size: u64, layer_metadata: *LayerMetadata, safetensor
 
 /// This function returns the weights values given the safetensors file path and a layer name.
 /// I need this dependency in my other code, this is to be used as external library.
-pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8) !*NDArray(f32) {
+pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8, allocator: std.mem.Allocator) !*NDArray(f32) {
     // https://huggingface.co/docs/safetensors/index <- Useful info on safetensors.
     // Safetensors TLDR: | HEADER SIZE (N)   | HEADER JSON | NUMBERS
     //                     ^^^ 8 bytes (u64)      N bytes  ^
@@ -244,20 +265,19 @@ pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8) !*N
     // dtype tells use how much bytes we need to read and what to cast the numbers to.
 
     // Read the header and parse the JSON.
-    var allocator = std.heap.page_allocator;
 
-    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
+    var layers_info = std.ArrayList(*LayerMetadata()).init(allocator);
     defer {
         for (layers_info.items) |*item| {
-            allocator.free(item.shape);
+            item.*.deinit();
         }
         layers_info.deinit();
     }
 
     // At this point, we will know all the layers names, their types, shapes, and offsets.
-    const header_size = try get_safetensors_content(safetensors_path, &allocator, &layers_info);
+    const header_size = try get_safetensors_content(safetensors_path, allocator, &layers_info);
 
-    var layer_metadata: LayerMetadata = undefined;
+    var layer_metadata: *LayerMetadata() = undefined;
     for (layers_info.items) |layer_spec| {
         layer_spec.print();
         if (std.mem.eql(u8, layer_spec.name, layer_name)) {
@@ -267,11 +287,12 @@ pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8) !*N
     layer_metadata.print();
 
     // We can extract the weights now.
-    return load_weights(header_size, &layer_metadata, safetensors_path, &allocator);
+    return load_weights(header_size, layer_metadata, safetensors_path, allocator);
 }
 
 pub fn main() !void {
-    var weights = try extract_weights(SAFETENSORS_FPATH, LAYER_TO_CONVERT);
+    const allocator = std.heap.page_allocator;
+    var weights = try extract_weights(SAFETENSORS_FPATH, LAYER_TO_CONVERT, allocator);
     weights.print();
     weights.deinit();
 }
