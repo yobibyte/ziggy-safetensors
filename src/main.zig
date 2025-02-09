@@ -165,6 +165,7 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
 
         const unk_shape = val.object.get("shape").?.array;
         const shape = try allocator.alloc(u64, unk_shape.items.len);
+        defer allocator.free(shape);
         // Shape is an array of integers, as we do not know the amount of items,
         // we need to allocate it explicitly on the heap.
         // We can probably have a max number and store the shape dims as well, but I took this path.
@@ -291,7 +292,8 @@ pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8, all
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
     var weights = try extract_weights(SAFETENSORS_FPATH, LAYER_TO_CONVERT, allocator);
     weights.print();
     weights.deinit();
