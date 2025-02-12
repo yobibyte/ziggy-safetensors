@@ -1,6 +1,3 @@
-//! NOTE: my editor highlights "NOTE:" comments, hopefully yours does as well.
-//! I tried to mark at least the more important changes in this format.
-//!
 //! This code allows you to load safetensors model natively in Zig.
 //! Some of the stuff is hardcoded intentionally to make the code simpler.
 //! I also avoided any external dependencies (ndarrays, arg parsing etc)
@@ -14,14 +11,13 @@ const std = @import("std");
 const HEADER_SIZE_BUFF_SIZE = 8;
 // I am using this model:
 // https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct/blob/main/model.safetensors
+// TODO(vkurin): add a function to load this automatically if file does not exist.
 const SAFETENSORS_FPATH = "/home/yobibyte/Downloads/model.safetensors";
 const LAYER_TO_CONVERT = "model.layers.9.self_attn.v_proj.weight";
 
 // Safetensors header has a JSON with metadata about our layers.
 // They all have a name, a shape, dtype, and offsets which tell us
 // how to find the bytes for those weights in the binary file.
-// pub fn LayerMetadata() type {
-// NOTE: No need for a function, types are values, having a function return a type is how zig implements generics but this is not generic.
 pub const LayerMetadata = struct {
     allocator: std.mem.Allocator,
     name: []u8,
@@ -32,32 +28,6 @@ pub const LayerMetadata = struct {
 
     const Self = @This();
 
-    // pub fn init(allocator: std.mem.Allocator, name: []const u8, shape: []u64, dtype: []const u8, offset_start: u64, offset_end: u64) !*Self {
-    //     var self = try allocator.create(Self);
-    //     self.allocator = allocator;
-    //
-    //     // Let's allocate memory for the struct fields so that
-    //     // we do not depend on the json object and can free it after we exit this function scope.
-    //     self.name = try allocator.alloc(u8, name.len);
-    //     @memcpy(self.name, name);
-    //     self.shape = try allocator.alloc(u64, shape.len);
-    //     @memcpy(self.shape, shape);
-    //     self.dtype = try allocator.alloc(u8, dtype.len);
-    //     @memcpy(self.dtype, dtype);
-    //     self.offset_start = offset_start;
-    //     self.offset_end = offset_end;
-    //     return self;
-    // }
-    //
-    // pub fn deinit(self: *Self) void {
-    //    self.allocator.free(self.name);
-    //    self.allocator.free(self.shape);
-    //    self.allocator.free(self.dtype);
-    //    self.allocator.destroy(self);
-    // }
-
-    // NOTE: no need to allocate Self, defer this decision to the caller (otherwise you are forced to allocate to construct, which you might not want)
-    // Also, allocator.dupe is convenient.
     pub fn init(allocator: std.mem.Allocator, name: []const u8, shape: []u64, dtype: []const u8, offset_start: u64, offset_end: u64) !Self {
         return Self{
             .name = try allocator.dupe(u8, name),
@@ -69,14 +39,12 @@ pub const LayerMetadata = struct {
         };
     }
 
-    // NOTE: no need to pass by reference
     pub fn deinit(self: Self) void {
         self.allocator.free(self.name);
         self.allocator.free(self.shape);
         self.allocator.free(self.dtype);
     }
 
-    // NOTE: no need to pass by reference
     pub fn print(self: LayerMetadata) void {
         std.debug.print("{s}\n  dtype:{s}\n", .{ self.name, self.dtype });
 
@@ -108,15 +76,6 @@ pub fn NDArray(comptime T: type) type {
         cols: usize,
         data: []T,
 
-        // pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !*@This() {
-        //     var self = try allocator.create(@This());
-        //     self.rows = rows;
-        //     self.cols = cols;
-        //     self.data = try allocator.alloc(T, rows * cols);
-        //     self.allocator = allocator;
-        //     return self;
-        // }
-        // NOTE: return by value is fine here
         pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !Self {
             return Self{
                 .rows = rows,
@@ -126,35 +85,18 @@ pub fn NDArray(comptime T: type) type {
             };
         }
 
-        // pub fn deinit(self: *@This()) void {
         pub fn deinit(self: Self) void {
             self.allocator.free(self.data);
-            // self.allocator.destroy(self);
         }
 
-        // pub fn at(self: *@This(), row: usize, col: usize) *T {
-        // pub fn at(self: Self, row: usize, col: usize) *T {
         pub fn at(self: *const Self, row: usize, col: usize) *T {
             return &self.data[row * self.cols + col];
         }
 
-        // pub fn copy_from(self: *@This(), array: *[]T) void {
-        // NOTE: a few thoughts. You dont want to pass a pointer to a slice (which is itself a pointer)
-        // Also, you calculate the index twice (once with `at()` and once inline).
-        // Also, you have contiguous arrays with the same layout (row major) so you can just copy
         pub fn copy_from(self: Self, array: []T) void {
-            // NOTE: a few ways of accomplishing this, here is just one (you could use the ptr capture you did layer on)
             std.mem.copyForwards(T, self.data, array);
-            // for (0..self.rows) |row| {
-            //     for (0..self.cols) |col| {
-            //         // self.at(row, col).* = array.*[row * self.cols + col];
-            //         self.at(row, col).* = array[row * self.cols + col];
-            //     }
-            // }
         }
 
-        // pub fn print(self: *@This()) void {
-        // NOTE: pass by value is fine here
         pub fn print(self: Self) void {
             //check that row, col > 3 or print all
             for (0..self.rows) |row| {
@@ -192,21 +134,18 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
     // Read 8 bytes first to get the header size.
     // We know the header size at comp time as it's the same for all safetensor files.
     var header_size_buf: [HEADER_SIZE_BUFF_SIZE]u8 = undefined;
-    // _ = try file.read(header_size_buf[0..]);
-    // NOTE: its more common to coerce an array to a slice like so...
-    // see https://ziglang.org/documentation/master/#toc-Type-Coercion-Slices-Arrays-and-Pointers
-    _ = try file.read(&header_size_buf); // recommend actually checking the number of bytes read
 
-    // const header_size = std.mem.readInt(u64, &header_size_buf, std.builtin.Endian.little);
-    // NOTE: Using enum shorthand notation is the convention (also useful if things get moved in new releases)
+    const bytes_read = try file.read(&header_size_buf);
+    if (bytes_read != HEADER_SIZE_BUFF_SIZE) {
+        std.debug.panic("Something is wrong! Expected bytes to read: {}. Actual bytes read:{}.]\n", .{ HEADER_SIZE_BUFF_SIZE, bytes_read });
+    }
+
     const header_size = std.mem.readInt(u64, &header_size_buf, .little);
     std.debug.print("Header size: {d} bytes.\n", .{header_size});
     // Read the header.
     const header_buf = try allocator.alloc(u8, header_size);
     defer allocator.free(header_buf);
 
-    // _ = try file.read(header_buf[0..]);
-    // NOTE: pass slice directly, see above
     _ = try file.read(header_buf); // recommend actually checking the number of bytes read
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_buf, .{});
@@ -214,13 +153,12 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
     var iter = parsed.value.object.iterator();
 
     while (iter.next()) |entry| {
-        // NOTE: dereference immediately, no need to keep a ptr around and keep dereferencing it (also, constness)
         const key = entry.key_ptr.*;
         // Skip metadata, we need only layers.
         if (std.mem.eql(u8, key, "__metadata__")) {
             continue;
         }
-        const val = entry.value_ptr.*; // NOTE: same as above
+        const val = entry.value_ptr.*;
         const dtype = val.object.get("dtype").?.string;
 
         const unk_shape = val.object.get("shape").?.array;
@@ -233,9 +171,6 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
         for (unk_shape.items, 0..) |el, idx| {
             switch (el) {
                 .integer => |num| {
-                    // const signless: u64 = @as(u64, @intCast(num));
-                    // shape[idx] = @intCast(signless);
-                    // NOTE: zig can infer type and perform the cast
                     shape[idx] = @intCast(num);
                 },
                 else => {},
@@ -247,15 +182,11 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
         // const offset_start: u64 = -1;
         // const offset_end: u64 = -1;
         const unk_offsets = val.object.get("data_offsets").?.array;
-        // NOTE: you only one of these u64's to inform the compiler what cast you want
-        // const offset_start: u64 = @as(u64, @intCast(unk_offsets.items[0].integer));
-        // const offset_end: u64 = @as(u64, @intCast(unk_offsets.items[1].integer));
         const offset_start: u64 = @intCast(unk_offsets.items[0].integer);
         const offset_end: u64 = @intCast(unk_offsets.items[1].integer);
         const cur_layer = try LayerMetadata.init(
             allocator,
-            // key.*[0..key.*.len],
-            key, // NOTE: no need to slice the slice to pass a slice :)
+            key,
             shape,
             dtype,
             offset_start,
@@ -279,7 +210,6 @@ pub fn batch_bf16bytes_to_fp32(bf16_buf: []u8, bf16_count: usize, fp32_buf: []f3
 }
 
 /// Get weights for a particular layer.
-// NOTE: pass layer_metadata by value
 pub fn load_weights(header_size: u64, layer_metadata: LayerMetadata, safetensors_path: []const u8, allocator: std.mem.Allocator) !NDArray(f32) {
     // Let's now take one layer and print it out.
     // We will need to read bytes from the file using the offset info
@@ -293,14 +223,12 @@ pub fn load_weights(header_size: u64, layer_metadata: LayerMetadata, safetensors
     // Weight offsets are starting with 0 meaning the first byte after the header.
     try file.seekTo(layer_metadata.offset_start + metadata_bytesize);
     const wbuf = try allocator.alloc(u8, read_len);
+    defer allocator.free(wbuf);
+
     const bytes_read = try file.read(wbuf);
-    if (bytes_read != read_len) { // NOTE: nice!
-        // NOTE: this is not how you want to error in zig. If it's unrecoverable then use panic, otherwise use an error type
-        // std.debug.print("Something is wrong! Expected bytes to read: {}. Actual bytes read:{}.]\n", .{ read_len, bytes_read });
-        // std.process.exit(1);
+    if (bytes_read != read_len) {
         std.debug.panic("Something is wrong! Expected bytes to read: {}. Actual bytes read:{}.]\n", .{ read_len, bytes_read });
     }
-    defer allocator.free(wbuf); // NOTE: move this line up, otherwise you could leak (e.g. if file.read errors)
 
     const bf16_count: usize = read_len / 2;
     const rows = layer_metadata.shape[0];
@@ -310,24 +238,11 @@ pub fn load_weights(header_size: u64, layer_metadata: LayerMetadata, safetensors
     std.debug.assert(rows * cols == bf16_count);
 
     // Original weights are in bf16, let's get fp32 from those.
-    // const f32_values = try allocator.alloc(f32, bf16_count); // NOTE: can now be const
     // defer allocator.free(f32_values);
     // NOTE: if we construct weights ourselves (described below) then dont deinit
-    const f32_values = try allocator.alloc(f32, bf16_count); // NOTE: can now be const
+    const f32_values = try allocator.alloc(f32, bf16_count);
     batch_bf16bytes_to_fp32(wbuf, bf16_count, f32_values);
 
-    // Let's get the 2D array printed to compare to what we see in Python (run test.py to compare).
-    // NOTE: could do this (but another option below)
-    // const weights = try allocator.create(NDArray(f32));
-    // weights.* = try NDArray(f32).init(allocator, rows, cols);
-    //
-    // var weights = try NDArray(f32).init(allocator, rows, cols);
-    // weights.copy_from(&f32_values);
-    // weights.copy_from(f32_values); // NOTE: slice is already a pointer
-    //
-    // NOTE: one thing to consider might be creating an NDArray without using init().
-    // This allows you to avoid extra allocations (can be easier to reason about).
-    // f32_values are already allocated so we can create the struct directly
     return NDArray(f32){
         .allocator = allocator,
         .rows = rows,
@@ -354,47 +269,26 @@ pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8, all
     // Read the header and parse the JSON.
 
     // At this point, we will know all the layers names, their types, shapes, and offsets.
-    // NOTE: No need to store values as pointers here, it makes ownership and lifetimes harder to reason about
-    // and will have worse performance.
     var layers_info = std.ArrayList(LayerMetadata).init(allocator);
     defer {
-        // NOTE: using the pointer capture is good for when you need a pointer, but you just needed the value
-        // and immediately deferenced it, so we can just capture that value normally.
-        // for (layers_info.items) |*item| {
-        //     item.*.deinit();
         for (layers_info.items) |item| item.deinit();
         layers_info.deinit();
     }
     // NOTE: as mentioned above, not so sure I would create layers_info this way but it depends what you had in mind
     const header_size = try get_safetensors_content(safetensors_path, allocator, &layers_info);
 
-    // NOTE: since we changed LayerMetadata's init to not allocate and return a ptr,
-    // we have some options to refactor this. Using a block is clean.
-    // Also, `layer_metadata` could easily be left `undefined` here which would be a huge problem.
-    // It is often said in regards to undefined behavior that "a crash is the best possible outcome"
-    // var layer_metadata: *LayerMetadata() = undefined;
-    // for (layers_info.items) |layer_spec| {
-    //     layer_spec.print();
-    //     if (std.mem.eql(u8, layer_spec.name, layer_name)) {
-    //         layer_metadata = layer_spec;
-    //     }
-    // }
     for (layers_info.items) |layer_spec| layer_spec.print();
     var layer_metadata = blk: {
         for (layers_info.items) |layer_spec| if (std.mem.eql(u8, layer_spec.name, layer_name)) break :blk layer_spec;
-        // Do something...
-        std.debug.panic("yikes", .{});
+        std.debug.panic("Requested layer {s} is not found in the safetensors file.", .{layer_name});
     };
     layer_metadata.print();
-    // NOTE: `load_weights` can error! use try or handle it here
     // We can extract the weights now.
-    // return load_weights(header_size, layer_metadata, safetensors_path, allocator);
     return try load_weights(header_size, layer_metadata, safetensors_path, allocator);
 }
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // NOTE: it's a good idea to deinit your gpa and check the return value
     defer switch (gpa.deinit()) {
         .leak => std.debug.panic("Leaked", .{}),
         .ok => {},
@@ -405,7 +299,6 @@ pub fn main() !void {
     weights.deinit();
 }
 
-// NOTE: in a test block0xxc
 test {
     const allocator = std.testing.allocator;
     var weights = try extract_weights(SAFETENSORS_FPATH, LAYER_TO_CONVERT, allocator);
