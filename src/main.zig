@@ -60,6 +60,29 @@ pub const LayerMetadata = struct {
     }
 };
 
+pub const LayersInfo = struct {
+    allocator: std.mem.Allocator,
+    layers_metadata: std.ArrayList(LayerMetadata),
+    header_size: u64,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, header_size: u64) Self {
+        return Self{
+            .allocator = allocator,
+            .layers_metadata = std.ArrayList(LayerMetadata).init(allocator),
+            .header_size = header_size,
+        };
+    }
+
+    pub fn deinit(self: LayersInfo) void {
+        defer {
+            for (self.layers_metadata.items) |item| item.deinit();
+            self.layers_metadata.deinit();
+        }
+    }
+};
+
 /// A struct that makes you belive that it is a two dimensional array.
 /// In practice, it's a 1D array with methods to access it as 2D.
 /// This uses row-based layout in memory, i.e. the element at i,j is
@@ -121,10 +144,7 @@ pub fn NDArray(comptime T: type) type {
     };
 }
 
-// NOTE: This creates `layers_info` so it doesnt have to be passed. However, one reason to pass `*std.ArrayList`
-// might be that you want the caller to own `layers_info` so it can be reused
-// (e.g. `layers_info.clearRetainingCapacity()`), but unclear if that was the idea.
-pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, layers_info: *std.ArrayList(LayerMetadata)) !u64 {
+pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator) !LayersInfo {
     // The code below is extremely hacky and was only tested on a model I mentioned above.
     // Ideally, we want a better JSON parser here, but it was not the goal.
     // Feel free to send PRs!
@@ -151,6 +171,8 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_buf, .{});
     defer parsed.deinit();
     var iter = parsed.value.object.iterator();
+
+    var layers_info = LayersInfo.init(allocator, header_size);
 
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
@@ -192,9 +214,9 @@ pub fn get_safetensors_content(fpath: []const u8, allocator: std.mem.Allocator, 
             offset_start,
             offset_end,
         );
-        try layers_info.append(cur_layer);
+        try layers_info.layers_metadata.append(cur_layer);
     }
-    return header_size;
+    return layers_info;
 }
 
 /// Get a slice of bytes representing bf16 and convert them to a slice of fp32.
@@ -239,7 +261,6 @@ pub fn load_weights(header_size: u64, layer_metadata: LayerMetadata, safetensors
 
     // Original weights are in bf16, let's get fp32 from those.
     // defer allocator.free(f32_values);
-    // NOTE: if we construct weights ourselves (described below) then dont deinit
     const f32_values = try allocator.alloc(f32, bf16_count);
     batch_bf16bytes_to_fp32(wbuf, bf16_count, f32_values);
 
@@ -269,22 +290,17 @@ pub fn extract_weights(safetensors_path: []const u8, layer_name: []const u8, all
     // Read the header and parse the JSON.
 
     // At this point, we will know all the layers names, their types, shapes, and offsets.
-    var layers_info = std.ArrayList(LayerMetadata).init(allocator);
-    defer {
-        for (layers_info.items) |item| item.deinit();
-        layers_info.deinit();
-    }
-    // NOTE: as mentioned above, not so sure I would create layers_info this way but it depends what you had in mind
-    const header_size = try get_safetensors_content(safetensors_path, allocator, &layers_info);
+    const layers_info = try get_safetensors_content(safetensors_path, allocator);
+    defer layers_info.deinit();
 
-    for (layers_info.items) |layer_spec| layer_spec.print();
+    for (layers_info.layers_metadata.items) |layer_spec| layer_spec.print();
     var layer_metadata = blk: {
-        for (layers_info.items) |layer_spec| if (std.mem.eql(u8, layer_spec.name, layer_name)) break :blk layer_spec;
+        for (layers_info.layers_metadata.items) |layer_spec| if (std.mem.eql(u8, layer_spec.name, layer_name)) break :blk layer_spec;
         std.debug.panic("Requested layer {s} is not found in the safetensors file.", .{layer_name});
     };
     layer_metadata.print();
     // We can extract the weights now.
-    return try load_weights(header_size, layer_metadata, safetensors_path, allocator);
+    return try load_weights(layers_info.header_size, layer_metadata, safetensors_path, allocator);
 }
 
 pub fn main() !void {
