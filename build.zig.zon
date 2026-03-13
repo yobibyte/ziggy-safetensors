@@ -1,8 +1,7 @@
 .{
     .name = "ziggy-safetensors",
     .version = "0.1.0",
-    .dependencies = .{
-    },
+    .dependencies = .{},
 
     .paths = .{
         "build.zig",
